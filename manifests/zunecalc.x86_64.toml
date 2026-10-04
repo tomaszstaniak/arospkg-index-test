@@ -1,0 +1,36 @@
+# APPROVED 2026-09-20 for v0.1.
+#
+# A Zune/MUI calculator.
+#
+# Installed, started and removed on AROS One 1.3 x86_64 in QEMU; see
+# docs/reports/2026-09-19-v01/. A hash and a clean unpack do not qualify a
+# package -- it has to have run.
+
+status          = "approved"
+id              = "zunecalc"
+version         = "1.0"
+summary         = "Simple Calculator"
+arch            = "x86_64"
+abi             = "v11"
+category        = "office/misc"
+url             = "https://archives.arosworld.org/share/office/misc/zunecalc.x86_64-aros-v11.zip"
+size            = 44996
+
+sha256          = "e730fdbb86aa4190f91d78bd9e26a3291ff42e42d0caab9bd2a8bf6ef18150d4"
+
+depends         = []
+depends_checked = true     # no package in the index is needed to install this
+
+kind            = "app"
+subdir          = "ZuneCalc"
+icon            = "ZuneCalc.info"
+
+installs_on     = ["aros-one"]
+runs_on         = ["aros-one"]
+does_not_run_on = ["mainline-x86_64"]   # ABIv11 binary; the ABI gate refuses it there
+
+# What the MACHINE must already provide: libraries AROS One ships and mainline
+# does not, read out of the binaries and checked against both systems' Libs/.
+[[requires_system]]
+type = "library"
+id   = "stdlib.library"

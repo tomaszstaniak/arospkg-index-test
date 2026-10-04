@@ -1,0 +1,43 @@
+# After a merge to main: regenerate index-v2.json and index.json from the
+# manifests and commit them. One run at a time; a run that fails writes
+# nothing, so the published files stay as they were. The push is refused if
+# main has moved since the run started, so an older run cannot replace a
+# newer catalogue.
+name: publish
+on:
+  push:
+    branches: [main]
+    paths: ["manifests/**", "overrides/**"]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: publish-index
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          # A test copy of this repository sets TOOLS_REPO/TOOLS_REF to test tools;
+          # here they are unset and the pinned arospkg commit is used.
+          repository: ${{ vars.TOOLS_REPO || 'tomaszstaniak/arospkg' }}
+          ref: ${{ vars.TOOLS_REF || 'c8b4eff01bc839424dbbbe4530e973b08d02638e' }}
+          path: .tools
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get install -y lhasa
+      - run: python3 .tools/tools/ci_check_index.py . --base "${{ github.event.before }}" --out-dir . --cache "$RUNNER_TEMP/archives"
+      - run: |
+          git add index.json index-v2.json
+          if git diff --cached --quiet; then echo "catalogue unchanged"; exit 0; fi
+          git -c user.name="arospkg-index" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Regenerate the catalogue from ${GITHUB_SHA::12}"
+          git push origin HEAD:main

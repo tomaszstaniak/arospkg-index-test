@@ -1,0 +1,40 @@
+# APPROVED 2026-09-20 for v0.1.
+#
+# A text viewer. Readme: written in C, requires no installation.
+#
+# Installed, started and removed on AROS One 1.3 x86_64 in QEMU; see
+# docs/reports/2026-09-19-v01/. A hash and a clean unpack do not qualify a
+# package -- it has to have run.
+
+status          = "approved"
+id              = "gmore"
+version         = "1.2"
+summary         = "Text viewer similar to MORE"
+arch            = "x86_64"
+abi             = "v11"
+category        = "utility/text"
+url             = "https://archives.arosworld.org/share/utility/text/gmore.x86_64-aros-v11.zip"
+size            = 35787
+
+sha256          = "65ecebd838705d29ffdb05dbd4727aa8e9c8f49342923a73e30d60acb6427131"
+
+depends         = []
+depends_checked = true     # no package in the index is needed to install this
+
+kind            = "app"
+subdir          = "GMore1.2"
+icon            = "GMore1.2.info"
+
+installs_on     = ["aros-one"]
+runs_on         = ["aros-one"]
+does_not_run_on = ["mainline-x86_64"]   # ABIv11 binary; the ABI gate refuses it there
+
+# What the MACHINE must already provide: libraries AROS One ships and mainline
+# does not, read out of the binaries and checked against both systems' Libs/.
+[[requires_system]]
+type = "library"
+id   = "crt.library"
+
+[[requires_system]]
+type = "library"
+id   = "stdlib.library"

@@ -1,0 +1,34 @@
+# Every pull request that changes a manifest: download each changed archive
+# within the client's limits, check its size and SHA-256 against the
+# manifest, and generate both catalogue files as a trial. Read-only token, no
+# secrets; nothing from the pull request is run (manifests are read as TOML
+# data, archives are only listed).
+name: check
+on:
+  pull_request:
+    paths: ["manifests/**", "overrides/**"]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The tools come from arospkg at a fixed commit, never from the pull request.
+      - uses: actions/checkout@v4
+        with:
+          # A test copy of this repository sets TOOLS_REPO/TOOLS_REF to test tools;
+          # here they are unset and the pinned arospkg commit is used.
+          repository: ${{ vars.TOOLS_REPO || 'tomaszstaniak/arospkg' }}
+          ref: ${{ vars.TOOLS_REF || 'c8b4eff01bc839424dbbbe4530e973b08d02638e' }}
+          path: .tools
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get install -y lhasa
+      - run: python3 .tools/tools/ci_check_index.py . --base "origin/${{ github.base_ref }}" --cache "$RUNNER_TEMP/archives"
