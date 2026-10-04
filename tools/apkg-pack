@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""apkg-pack: describe an AROS program once, check it, pack it, and prepare
+its catalogue entry from the uploaded archive.
+
+    apkg-pack init   DRAWER [options]        write DRAWER.arospkg.toml beside it
+    apkg-pack check  DRAWER | ARCHIVE        the catalogue's own rules
+    apkg-pack build  DRAWER --output X.zip   the archive, checked after writing
+    apkg-pack submit URL [--index DIR] [--dry-run] | --pr [--repo OWNER/NAME]
+
+The manifest is the one the catalogue uses today (docs/guide/metadata.md),
+without the fields that come from the uploaded file: url, size, sha256 and
+status are filled in by `submit`. In the archive it is .arospkg/manifest.toml.
+The rules are mkindex.py's, imported, not copied: a package this tool accepts
+is one the catalogue generator accepts.
+
+This runs on the host (macOS, Linux, a CI runner). It does not run the
+program and says nothing about whether it works on any AROS.
+"""
+import argparse
+import difflib
+import hashlib
+import io
+import os
+import re
+import sys
+import tempfile
+import tomllib
+import urllib.request
+import zipfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import mkindex  # noqa: E402
+
+DOWNLOAD_MAX = 64 * 1024 * 1024          # the client's own download limit
+FILE_MAX, TOTAL_MAX = 64 * 1024 * 1024, 256 * 1024 * 1024
+JUNK = re.compile(r"(^|/)(\.DS_Store|\._[^/]*|\.git(/|$)|Thumbs\.db)")
+EM_ARCH = {62: "x86_64", 3: "i386", 183: "aarch64"}
+# Key order of a written manifest: plain keys before any table (TOML puts a
+# key written after a [[table]] header inside that table).
+ORDER = ("id", "version", "revision", "summary", "category", "license", "kind",
+         "arch", "abi", "subdir", "icon", "depends", "depends_checked",
+         "installs_on", "runs_on", "does_not_run_on", "post_install_notes")
+GENERATED = "# Written by apkg-pack submit from the archive's .arospkg/manifest.toml.\n" \
+            "# Do not edit: a maintainer's change goes in overrides/{name}, which\n" \
+            "# every later submission applies again.\n"
+
+
+def fail(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def manifest_path(drawer):
+    return drawer.parent / f"{drawer.name}.arospkg.toml"
+
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return '"' + v + '"'          # mkindex refuses '"' and '\\' anyway
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    raise ValueError(f"cannot write {v!r}")
+
+
+def write_toml(m, header=""):
+    lines = [header] if header else []
+    def plain(v):
+        return not isinstance(v, dict) and not (isinstance(v, list) and v and isinstance(v[0], dict))
+    keys = [k for k in ORDER if k in m] + sorted(k for k in m if k not in ORDER and plain(m[k]))
+    for k in keys:
+        if k == "post_install_notes":
+            lines.append("post_install_notes = [")
+            lines += [f"  {toml_value(x)}," for x in m[k]]
+            lines.append("]")
+        else:
+            lines.append(f"{k:<15} = {toml_value(m[k])}")
+    for r in m.get("requires_system", []):
+        lines += ["", "[[requires_system]]"] + [f"{k} = {toml_value(v)}" for k, v in r.items()]
+    for k, v in m.items():
+        if isinstance(v, dict):
+            lines += ["", f"[{k}]"] + [f"{a} = {toml_value(b)}" for a, b in v.items()]
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ reading
+
+def elf_facts(drawer):
+    """CPUs of the ELF files in a drawer, and the first $VER: string found."""
+    arches, ver = set(), None
+    for p in sorted(drawer.rglob("*")):
+        if not p.is_file() or p.stat().st_size < 64:
+            continue
+        with p.open("rb") as f:
+            head = f.read(20)
+            if head[:4] != b"\x7fELF":
+                continue
+            arches.add(EM_ARCH.get(int.from_bytes(head[18:20], "little"), f"machine {head[18]}"))
+            if ver is None:
+                hit = re.search(rb"\$VER: ?([^\x00\n\r]{1,80})", head + f.read())
+                if hit:
+                    ver = hit.group(1).decode("latin-1").strip()
+    return arches, ver
+
+
+def tree_names(drawer, icon):
+    """The member names the drawer would have in an archive."""
+    names, sizes = set(), {}
+    sub = drawer.name
+    names.add(sub + "/")
+    for p in sorted(drawer.rglob("*")):
+        rel = sub + "/" + p.relative_to(drawer).as_posix()
+        if JUNK.search(rel):
+            continue
+        if p.is_dir():
+            names.add(rel + "/")
+        elif p.is_file():
+            names.add(rel)
+            sizes[rel] = p.stat().st_size
+    if icon and (drawer.parent / icon).is_file():
+        names.add(icon)
+        sizes[icon] = (drawer.parent / icon).stat().st_size
+    return names, sizes
+
+
+def read_embedded(data):
+    """The .arospkg/manifest.toml inside a ZIP or LHA, and its member names."""
+    if data[:4] == b"PK\x03\x04":
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = set(z.namelist())
+        if ".arospkg/manifest.toml" not in names:
+            return None, names
+        return z.read(".arospkg/manifest.toml").decode("utf-8"), names
+    with tempfile.TemporaryDirectory() as d:
+        a = Path(d) / "a.lha"
+        a.write_bytes(data)
+        names = mkindex.archive_names(a)
+        if ".arospkg/manifest.toml" not in names:
+            return None, names
+        import subprocess
+        text = subprocess.run(["lha", "pq", str(a), ".arospkg/manifest.toml"],
+                              capture_output=True, check=True).stdout.decode("utf-8")
+        return text, names
+
+
+def parse_author(text, where):
+    try:
+        m = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        fail(f"{where}: not valid TOML: {exc}")
+    if "targets" in m or "install" in m and isinstance(m["install"], dict) and "subdir" in m["install"]:
+        fail(f"{where}: this is the format proposed in RFC 0001 ([[targets]], [install]), which "
+             "the catalogue does not read yet. Write the current format: apkg-pack init.")
+    return m
+
+
+def report(problems, where):
+    for p in problems:
+        print(f"{where}: {p}")
+    return 1 if problems else 0
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_init(a):
+    drawer = Path(a.drawer).resolve()
+    if not drawer.is_dir():
+        fail(f"{a.drawer}: not a drawer")
+    out = manifest_path(drawer)
+    if out.exists():
+        fail(f"{out} already exists; apkg-pack does not overwrite a description. "
+             "Edit it, or delete it to start again.")
+    arches, ver = elf_facts(drawer)
+    icon = drawer.name + ".info" if (drawer.parent / (drawer.name + ".info")).is_file() else ""
+    suggested_id = re.sub(r"[^a-z0-9._-]", "", drawer.name.lower()) or None
+    suggested_version = None
+    if ver:
+        words = ver.split()
+        suggested_version = next((w for w in words[1:] if re.match(r"^\d", w)), None)
+    arch = a.arch or (next(iter(arches)) if len(arches) == 1 and next(iter(arches)) in mkindex.ARCHES else None)
+
+    # Without a terminal, what was read from the drawer stands; nothing else
+    # is assumed.
+    ask = (lambda q, d=None: d) if a.non_interactive else prompt
+    m = {}
+    m["id"] = a.id or ask("Package id (lowercase, it names the installed drawer)", suggested_id)
+    m["version"] = a.version or ask("Version, as upstream calls it", suggested_version)
+    if a.revision:
+        m["revision"] = a.revision
+    m["summary"] = a.summary or ask("One-line summary")
+    category = a.category or ask("Category, e.g. game/puzzle (empty for none)", "")
+    if category:
+        m["category"] = category
+    if a.license or not a.non_interactive:
+        lic = a.license or ask("Licence (empty if not stated)", "")
+        if lic:
+            m["license"] = lic
+    m["kind"] = a.kind or ask("Kind (app, tool, library, data)", None if a.non_interactive else "app")
+    m["arch"] = arch or ask(f"CPU (one of {', '.join(mkindex.ARCHES)}); "
+                            f"found in the drawer: {', '.join(sorted(arches)) or 'no ELF file'}")
+    # Never guessed: a binary for one ABI installs on the other and crashes.
+    m["abi"] = a.abi or ask("ABI: v11 (AROS One and current distributions), v1 (mainline), v0 (i386)")
+    m["subdir"] = drawer.name
+    if icon:
+        m["icon"] = icon
+    if a.no_depends:
+        m["depends"], m["depends_checked"] = [], True
+    elif a.depends:
+        m["depends"], m["depends_checked"] = a.depends, True
+    elif not a.non_interactive:
+        d = ask("Other arospkg packages it needs, comma separated (empty for none)", "")
+        m["depends"], m["depends_checked"] = [x.strip() for x in d.split(",") if x.strip()], True
+    if a.requires or a.no_requires:
+        reqs = a.requires or []
+    elif not a.non_interactive:
+        r = ask("System libraries it needs, e.g. crt.library, comma separated (empty for none)", "")
+        reqs = [x.strip() for x in r.split(",") if x.strip()]
+    else:
+        reqs = None
+    if a.note:
+        m["post_install_notes"] = a.note
+    if reqs is not None:
+        m["requires_system"] = [{"type": "library", "id": x} for x in reqs]
+
+    missing = [k for k in ("id", "version", "summary", "kind", "arch", "abi") if not m.get(k)]
+    if "depends_checked" not in m:
+        missing.append("depends (--depends ID or --no-depends)")
+    if reqs is None:
+        missing.append("requires_system (--requires LIB or --no-requires)")
+    if missing:
+        fail("not written; still needed: " + ", ".join(missing))
+    m = {k: v for k, v in m.items() if v not in (None, "")}
+    problems = mkindex.check(m, "author")
+    if problems:
+        report(problems, out.name)
+        fail("not written")
+    out.write_text(write_toml(m), encoding="utf-8")
+    print(f"written {out}")
+    print("Next: apkg-pack check " + a.drawer)
+
+
+def prompt(q, default=None):
+    shown = f" [{default}]" if default else ""
+    try:
+        v = input(f"{q}{shown}: ").strip()
+    except EOFError:
+        v = ""
+    return v or default
+
+
+def load_drawer(drawer):
+    mp = manifest_path(drawer)
+    if not mp.is_file():
+        fail(f"{mp} not found; run apkg-pack init {drawer} first")
+    return parse_author(mp.read_text(encoding="utf-8"), mp.name), mp
+
+
+def check_drawer(drawer, m, where):
+    problems = mkindex.check(m, "author")
+    if m.get("subdir") != drawer.name:
+        problems.append(f"subdir: {m.get('subdir')!r}, but the drawer is {drawer.name!r}")
+    names, sizes = tree_names(drawer, m.get("icon"))
+    problems += mkindex.check_members(m, names, "the drawer")
+    for n, s in sizes.items():
+        if s > FILE_MAX:
+            problems.append(f"member {n}: {s} bytes; the client installs files up to {FILE_MAX}")
+    if sum(sizes.values()) > TOTAL_MAX:
+        problems.append(f"subdir: {sum(sizes.values())} bytes unpacked; the client takes {TOTAL_MAX}")
+    arches, _ = elf_facts(drawer)
+    if arches and m.get("arch") and arches != {m["arch"]}:
+        problems.append(f"arch: {m['arch']!r}, but the drawer holds ELF files for "
+                        f"{', '.join(sorted(arches))}")
+    return report(problems, where), names, sizes
+
+
+def cmd_check(a):
+    p = Path(a.path)
+    if p.is_dir():
+        drawer = p.resolve()
+        m, mp = load_drawer(drawer)
+        rc, names, sizes = check_drawer(drawer, m, mp.name)
+        if rc == 0:
+            print(f"ok: {m['id']} {m['version']} for {m['arch']}/{m['abi']}: "
+                  f"{sum(1 for n in names if not n.endswith('/'))} files, {sum(sizes.values())} bytes")
+        sys.exit(rc)
+    data = p.read_bytes()
+    text, names = read_embedded(data)
+    if text is None:
+        fail(f"{p}: no .arospkg/manifest.toml in the archive")
+    m = parse_author(text, f"{p.name}:.arospkg/manifest.toml")
+    rc = report(mkindex.check(m, "author") + mkindex.check_members(m, names), p.name)
+    if rc == 0:
+        print(f"ok: {m['id']} {m['version']} for {m['arch']}/{m['abi']}; "
+              f"{len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}")
+    sys.exit(rc)
+
+
+def cmd_build(a):
+    drawer = Path(a.drawer).resolve()
+    out = Path(a.output).resolve()
+    if drawer in out.parents:
+        fail(f"{a.output} is inside the drawer; it would be packed into itself")
+    m, mp = load_drawer(drawer)
+    rc, names, _ = check_drawer(drawer, m, mp.name)
+    if rc:
+        fail("not built")
+    # Same inputs, same bytes: fixed order, time, permissions and compression.
+    epoch = int(a.epoch if a.epoch is not None else os.environ.get("SOURCE_DATE_EPOCH", 315532800))
+    stamp = tuple(__import__("time").gmtime(max(epoch, 315532800))[:6])
+    manifest_text = mp.read_text(encoding="utf-8")
+    tmp = out.with_name(out.name + ".part")
+    with zipfile.ZipFile(tmp, "w") as z:
+        def add(name, data=None, src=None):
+            zi = zipfile.ZipInfo(name, stamp)
+            zi.create_system = 3
+            if name.endswith("/"):
+                zi.external_attr = (0o40755 << 16) | 0x10
+                z.writestr(zi, b"")
+                return
+            zi.external_attr = 0o644 << 16
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(zi, data if data is not None else src.read_bytes(), compresslevel=9)
+        for n in sorted(names):
+            if n.endswith("/"):
+                add(n)
+            elif n == m.get("icon"):
+                add(n, src=drawer.parent / n)
+            else:
+                add(n, src=drawer.parent / n)
+        add(".arospkg/")
+        add(".arospkg/manifest.toml", data=manifest_text.encode("utf-8"))
+    data = tmp.read_bytes()
+    text, got = read_embedded(data)
+    problems = mkindex.check_members(m, got)
+    if text != manifest_text or problems:
+        tmp.unlink()
+        report(problems or ["the manifest read back differs from the one written"], out.name)
+        fail("not built")
+    tmp.replace(out)
+    print(f"written {out}: {len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()}")
+    print("Upload it to a URL that will not change, then: apkg-pack submit <url>")
+
+
+def fetch(url, local):
+    if local:
+        return Path(local).read_bytes()
+    req = urllib.request.Request(url, headers={"User-Agent": "apkg-pack"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        data = r.read(DOWNLOAD_MAX + 1)
+    if len(data) > DOWNLOAD_MAX:
+        fail(f"{url}: larger than the {DOWNLOAD_MAX} bytes the client downloads")
+    return data
+
+
+def index_manifest(url, data, index_dir):
+    """The arospkg-index manifest for an uploaded archive: the author's
+    description and the publication data measured on the file. Returns the
+    file it belongs in, the manifest, and the effective entry with the
+    maintainer's overrides applied, as the generator will apply them."""
+    text, names = read_embedded(data)
+    if text is None:
+        fail(f"{url}: the archive has no .arospkg/manifest.toml. Packages without one are "
+             "described by a maintainer in arospkg-index/manifests, as before.")
+    author = parse_author(text, "the archive's .arospkg/manifest.toml")
+    problems = mkindex.check(author, "author") + mkindex.check_members(author, names)
+    if report(problems, "the archive"):
+        fail("not submitted")
+    m = {"status": "approved", **author,
+         "url": url, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    mdir = index_dir / "manifests"
+    # A file from before the ABI was in the name stays where it is, if it is
+    # this variant.
+    legacy = mdir / f"{m['id']}.{m['arch']}.toml"
+    target = legacy if legacy.is_file() and tomllib.loads(legacy.read_text(encoding="utf-8")).get("abi") == m["abi"] \
+        else mdir / mkindex.variant_file(m)
+    ov = mkindex.overrides_for(target)
+    if isinstance(ov, str):
+        fail(ov)
+    effective = {**m, **(ov or {})}
+    if report(mkindex.check(effective), target.name):
+        fail("not submitted")
+    return target, m, effective, ov or {}
+
+
+def published_release(index_dir, m):
+    """version, revision and sha256 of this variant in any manifest, or None."""
+    for f in (index_dir / "manifests").glob("*.toml"):
+        try:
+            p = tomllib.loads(f.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError:
+            continue
+        if (p.get("id"), p.get("arch"), p.get("abi")) == (m["id"], m["arch"], m["abi"]) and p.get("sha256"):
+            return p.get("version"), p.get("revision", 0), p["sha256"]
+    return None
+
+
+def cmd_submit(a):
+    if not a.url.startswith("https://"):
+        fail("the URL must be https://; the client fetches nothing else")
+    data = fetch(a.url, a.use_local_copy)
+    if a.pr:
+        import publish_github
+        # A fresh clone of the catalogue: nothing else staged or changed in a
+        # checkout of the author's can end up in the pull request.
+        work = publish_github.checkout(a.repo)
+        index_dir = work
+    else:
+        index_dir = Path(a.index).resolve()
+    if not (index_dir / "manifests").is_dir():
+        fail(f"{index_dir}: not an arospkg-index checkout (no manifests/)")
+    target, m, effective, ov = index_manifest(a.url, data, index_dir)
+    name = target.name
+    new = write_toml(m, GENERATED.format(name=name))
+    old = target.read_text(encoding="utf-8") if target.exists() else None
+    if old == new:
+        print(f"{name}: already up to date; nothing to submit")
+        return
+    was = published_release(index_dir, m)
+    if was and was[0] == m["version"] and was[1] == m.get("revision", 0) and was[2] != m["sha256"]:
+        fail(f"{name}: version {m['version']} revision {m.get('revision', 0)} is already "
+             f"published with sha256 {was[2]}, and this file has {m['sha256']}. "
+             "Different bytes need a new revision (or version) and, normally, a new URL. "
+             "apkg-pack does not renumber a release for you.")
+    if old is not None and not old.startswith(GENERATED.splitlines()[0]):
+        print(f"note: {name} was written by a maintainer; this replaces it with the "
+              "author's description. Anything the maintainer meant to keep belongs in "
+              f"overrides/{name}.")
+    if ov:
+        print(f"overrides/{name} changes {', '.join(sorted(ov))} when the catalogue is made")
+    diff = difflib.unified_diff((old or "").splitlines(True), new.splitlines(True),
+                                f"a/manifests/{name}", f"b/manifests/{name}")
+    sys.stdout.writelines(diff)
+    if a.dry_run:
+        print("\n(dry run: nothing written)")
+        return
+    target.write_text(new, encoding="utf-8")
+    print(f"\nwritten {target}")
+    if a.pr:
+        publish_github.open_pr(work, a.repo, target, m)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="apkg-pack", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init", help="describe a drawer: write DRAWER.arospkg.toml beside it")
+    i.add_argument("drawer")
+    i.add_argument("--non-interactive", action="store_true", help="ask nothing; fail on what is missing")
+    for k in ("id", "version", "summary", "category", "license", "kind", "arch", "abi"):
+        i.add_argument("--" + k)
+    i.add_argument("--revision", type=int)
+    i.add_argument("--requires", action="append", metavar="LIB", help="a system library it needs")
+    i.add_argument("--no-requires", action="store_true", help="it needs no system library")
+    i.add_argument("--depends", action="append", metavar="ID", help="another arospkg package it needs")
+    i.add_argument("--no-depends", action="store_true", help="it needs no other package")
+    i.add_argument("--note", action="append", help="a line of post_install_notes (repeat for more)")
+    c = sub.add_parser("check", help="check a drawer and its manifest, or a built archive")
+    c.add_argument("path")
+    b = sub.add_parser("build", help="pack a drawer and its manifest into a ZIP")
+    b.add_argument("drawer")
+    b.add_argument("--output", required=True)
+    b.add_argument("--epoch", type=int, help="timestamp for every member (default SOURCE_DATE_EPOCH or 1980)")
+    s = sub.add_parser("submit", help="prepare the arospkg-index entry for an uploaded archive")
+    s.add_argument("url")
+    s.add_argument("--index", default=str(HERE.parent.parent / "arospkg-index"))
+    s.add_argument("--dry-run", action="store_true", help="show the change; write nothing")
+    s.add_argument("--pr", action="store_true",
+                   help="open a pull request (through your fork if you cannot push to --repo)")
+    s.add_argument("--repo", default="tomaszstaniak/arospkg-index", help="the catalogue repository (OWNER/NAME)")
+    s.add_argument("--use-local-copy", metavar="FILE", help=argparse.SUPPRESS)
+    a = ap.parse_args()
+    {"init": cmd_init, "check": cmd_check, "build": cmd_build, "submit": cmd_submit}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
