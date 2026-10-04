@@ -43,7 +43,7 @@
       "summary": "gmore 1.2 repacked by apkg-pack (acceptance test)",
       "arch": "x86_64",
       "abi": "v11",
-      "category": "utility/text",
+      "category": "game/action",
       "url": "https://github.com/tomaszstaniak/arospkg-index-test/releases/download/test-uxpack-1.2/uxpack.x86_64-aros-v11.zip",
       "size": 36344,
       "sha256": "c0e3c250e1f72ad1f572dad55fb930564391be89ac38e6a2e1dc7dc5f3d4f998",
